@@ -1,278 +1,366 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Sep 03 09:06:06 2016
-@author: DIP
-"""
+from requests.adapters import HTTPAdapter
+from bs4 import BeautifulSoup
+import mysql.connector
+import os, time,random
+import threading
+import requests
+import queue
+import csv
+import sys
+def get_total_page(url):
+    total_page=0
+    headers={
+        'user-agent':'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36',
+    }
+    try:
+        res=requests.get(url,headers=headers,timeout=30)
+        soup=BeautifulSoup(res.text,'html.parser')
+        tpage=int(soup.select('#simple-pager')[0].select('.ui-label')[0].text.split('/')[1])
+        total_page=tpage
 
-from gensim import corpora, models
-from normalization import normalize_corpus
-import numpy as np
+        if total_page>=500:
+            total_page=500
+            print('总共有'+str(total_page)+'页')
+    except requests.RequestException as e:
+        print("requestsException")
+        print(e)
+    except requests.ConnectionError as e:
+        print("connectionError")
+        print(e)
+    except requests.HTTPError as e:
+        print("httpError")
+        print(e)
+    except requests.URLRequired as e:
+        print('urlRequired')
+        print(e)
+    except requests.ConnectTimeout as e:
+        print("connectTimeout")
+        print(e)
+    except requests.ReadTimeout as e:
+        print("readTimeout")
+        print(e)
+    except Exception as e:
+        print("获取总页数失败")
+        print("失败信息")
+        print(e)
+    finally:
+        return total_page
 
-toy_corpus = ["The fox jumps over the dog",
-"The fox is very clever and quick",
-"The dog is slow and lazy",
-"The cat is smarter than the fox and the dog",
-"Python is an excellent programming language",
-"Java and Ruby are other programming languages",
-"Python and Java are very popular programming languages",
-"Python programs are smaller than Java programs"]
+def get_url(productid,owner_memberid,companyid,member_type="seller",start_valid_date="",il8n="true"):
+    host="https://feedback.aliexpress.com/display/productEvaluation.htm?"
+    url=host+"productId="+productid
+    url+="&ownerMemberId="+owner_memberid
+    url+="&companyId="+companyid
+    url+="&memberType="+member_type
+    url+="&startValidDate="+start_valid_date
+    url+="s&il8n="+il8n
+    return url
 
-# LSI topic model
-norm_tokenized_corpus = normalize_corpus(toy_corpus, tokenize=True)
-norm_tokenized_corpus
+def update_ip_list():
+    url='http://www.xicidaili.com/nn/'
+    headers={
+        'user-agent':'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36',
+    }
+    web_data=requests.get(url,headers=headers)
+    soup=BeautifulSoup(web_data.text,'html.parser')
+    ips=soup.select('tr')
+    ip_list=[]
+    for i in range(1,len(ips)):
+        ip_info=ips[i]
+        tds=ip_info.select('td')
+        ip_list.append(tds[1].text+':'+tds[2].text)
+    with open("iplist.txt","a",encoding='utf-8') as f:
+            for ip in ip_list:
+                f.write(ip)
+                f.write('\n')
+    return ip_list
+class CommentSpyder(threading.Thread):
+    headers={
+        'authority':'feedback.aliexpress.com',
+        'method':'POST',
+        'path':'/display/productEvaluation.htm',
+        'scheme':'https',
+        'accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'accept-encoding':'gzip, deflate, br',
+        'accept-language':'zh-CN,zh;q=0.8',
+        'cache-control':'max-age=0',
+        'content-length':'359',
+        'content-type':'application/x-www-form-urlencoded',
+        'origin':'https://feedback.aliexpress.com',
+        'referer':'https://feedback.aliexpress.com/display/productEvaluation.htm?productId=32666095400&ownerMemberId=223547137&companyId=233309784&memberType=seller&startValidDate=&i18n=true',
+        'upgrade-insecure-requests':'1',
+        'user-agent':'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36',
+    }
 
-dictionary = corpora.Dictionary(norm_tokenized_corpus)
-print dictionary.token2id
+    def __init__(self,url,productid,owner_memberid,companyid,result_queue,start_page=1,end_page=1):
+        super().__init__()
+        self.url=url
+        self.posturl="https://feedback.aliexpress.com/display/productEvaluation.htm"
+        self.productid=productid
+        self.owner_memberid=owner_memberid
+        self.companyid=companyid
+        self.result_queue = result_queue
+        self.start_page=start_page
+        self.end_page=end_page
+        if(self.productid=='' or self.owner_memberid==''):
+            print('初始化失败')
+            print('请输入产品编号，店主编号，以及公司编号')
+            return
+        self.session=requests.Session()
+        self.session.keep_live=False
+        self.ip_list=self.get_ip_list()
+        self.token=self.get_token(self.session)
+        if self.token=='':
+            print('爬虫初始化失败 caused by token 获取失败')
+            return
+        self.data=dict()
+        self.create_post_data()
+        print("报告老大:知客爬虫初始化已完毕,等待爬取数据")
 
-corpus = [dictionary.doc2bow(text) for text in norm_tokenized_corpus]
-corpus
+    def create_post_data(self):
+        self.data['ownerMemberId']=self.owner_memberid
+        self.data['memberType']='seller'
+        self.data['productId']=self.productid
+        self.data['companyId']=''
+        self.data['evaStarFilterValue']='all Stars'
+        self.data['evaSortValue']='sortdefault@feedback'
+        self.data['startValidDate']=''
+        self.data['i18n']='true'
+        self.data['withPictures']='false'
+        self.data['withPersonalInfo']='false'
+        self.data['withAdditionalFeedback']='false'
+        self.data['onlyFromMyCountry']='false'
+        self.data['isOpened']='true'
+        self.data['version']='evaNlpV1_2'
+        self.data['translate']='Y'
+        self.data['jumpToTop']='false'
+        self.data['_csrf_token']=self.token
 
-tfidf = models.TfidfModel(corpus)
-corpus_tfidf = tfidf[corpus]
+    def get_ip_list(self):
+        temp_ip_list=[]
+        with open('iplist.txt', 'r') as f:
+            while True:
+                ip=f.readline().replace('\n','')
+                temp_ip_list.append('http://'+ip)
+                if not ip:
+                    break
+        return temp_ip_list
 
-total_topics = 2
+    def get_random_ip(self):
+        proxy_ip=random.choice(self.ip_list)
+        proxies={
+            'http':proxy_ip
+        }
+        return proxies
 
-lsi = models.LsiModel(corpus_tfidf, 
-                      id2word=dictionary, 
-                      num_topics=total_topics)
-                      
-for index, topic in lsi.print_topics(total_topics):
-    print 'Topic #'+str(index+1)
-    print topic
-    print              
-    
+    def get_token(self,session):
+        _csrf_token=''
+        try:
+            proxies=self.get_random_ip()
+            self.proxies=proxies
+            res=self.session.get(self.url)
+            soup=BeautifulSoup(res.text,'html.parser')
+            inputs=soup.select('#l-refresh-form')[0].select("input")
+            _csrf_token=inputs[len(inputs)-1]['value']
+        except requests.RequestException as e:
+            print("requestsException")
+            print(e)
+        except requests.ConnectionError as e:
+            print("connectionError")
+            print(e)
+        except requests.HTTPError as e:
+            print("httpError")
+            print(e)
+        except requests.URLRequired as e:
+            print('urlRequired')
+            print(e)
+        except requests.ConnectTimeout as e:
+            print("connectTimeout")
+            print(e)
+        except requests.ReadTimeout as e:
+            print("readTimeout")
+            print(e)
+        except Exception as e:
+            print("获取token失败")
+            print("失败信息")
+            print(e)
+        finally:
+            return _csrf_token
 
-def print_topics_gensim(topic_model, total_topics=1,
-                        weight_threshold=0.0001,
-                        display_weights=False,
-                        num_terms=None):
-    
-    for index in range(total_topics):
-        topic = topic_model.show_topic(index)
-        topic = [(word, round(wt,2)) 
-                 for word, wt in topic 
-                 if abs(wt) >= weight_threshold]
-        if display_weights:
-            print 'Topic #'+str(index+1)+' with weights'
-            print topic[:num_terms] if num_terms else topic
-        else:
-            print 'Topic #'+str(index+1)+' without weights'
-            tw = [term for term, wt in topic]
-            print tw[:num_terms] if num_terms else tw
-        print
-    
+    def parse_comment(self,comment_html):
+        try:
+            comment_soup=BeautifulSoup(comment_html.text,'html.parser')
+        except Exception as e:
+            print("suop构造失败")
+            print(e)
+            return
+        try:
+            feedback_star=comment_soup.select('.star-view')
+            fb_mains=comment_soup.select('.fb-main')
+            user_info=comment_soup.select('.fb-user-info')
+            for i in range(0,len(fb_mains)):
+                temp=[]
+                try:
+                    username=user_info[i].select('.user-name')[0].text.replace('\t','').replace('\n','')
+                except Exception as e:
+                    username=''
+                try:
+                    usercountry=user_info[i].select('.user-country')[0].text.replace('\t','').replace('\n','')
+                except:
+                    usercountry=''
+                try:
+                    star=int(fb_mains[i].select('.star-view')[0].select('span')[0]['style'].lstrip('width:').rstrip('%'))/20
+                except Exception as e:
+                    star=0
+                try:
+                    buyer_review=fb_mains[i].select('.buyer-review')[0]
+                    buyer_feedback=buyer_review.select('.buyer-feedback')[0].select('span')[0].text.lstrip(' ').rstrip(' ').replace('\t',' ').replace('\n',' ')
+                except Exception as e:
+                    buyer_feedback=''
+                try:
+                    buyer_review=fb_mains[i].select('.buyer-review')[0]
+                    picture_num=int(buyer_review.select('dd')[0]['data-image-num'])
+                except Exception as e:
+                    picture_num=0
+                try:
+                    feedback_time=buyer_review.select('.r-time')[0].text
+                except Exception as e:
+                    feedback_time=''
+                try:
+                    additional_review=fb_mains[i].select('.buyer-addition-feedback')
+                    if len(additional_review)>0:
+                        additional_feedback=additional_review[0].text.lstrip(' ').rstrip(' ').replace('\t',' ').replace('\n',' ')
+                    else:
+                        additional_feedback=''
+                except Exception as e:
+                    additional_feedback=''
+                    print(e)
+                tempData=dict()
+                tempData['username']=username
+                tempData['usercountry']=usercountry
+                tempData['buyer_feedback']=buyer_feedback
+                tempData['picture_num'] = picture_num
+                tempData['star']=star
+                tempData['feedback_time']=feedback_time
+                tempData['additional_feedback']=additional_feedback
 
-print_topics_gensim(topic_model=lsi,
-                    total_topics=total_topics,
-                    num_terms=5,
-                    display_weights=True)
+                print(tempData)
+                print('\n')
+                self.result_queue.put(tempData)
+        except Exception as e:
+            print("解析出错")
+            print("出错信息")
+            print(e)
 
-    
-# LSI custom built topic model    
-from utils import build_feature_matrix, low_rank_svd
+    def crawl_comment_by_page(self,page):
+        current_page=page-1
+        if current_page==0:
+            current_page=2
+        self.data['page']=str(page)
+        self.data['currentPage']=str(current_page)
+        try:
+            proxies=self.get_random_ip()
+            comment_html=self.session.post(self.posturl,headers=self.headers,data=self.data,timeout=30,proxies=proxies)
+            self.parse_comment(comment_html)
+        except requests.RequestException as e:
+            print("requestsException")
+            print(e)
+        except requests.ConnectionError as e:
+            print("connectionError")
+            print(e)
+        except requests.HTTPError as e:
+            print("httpError")
+            print(e)
+        except requests.URLRequired as e:
+            print('urlRequired')
+            print(e)
+        except requests.ConnectTimeout as e:
+            print("connectTimeout")
+            print(e)
+        except requests.ReadTimeout as e:
+            print("readTimeout")
+            print(e)
+        except Exception as e:
+            print("爬取出错")
+            print("出错信息")
+            print(e)
+    def run(self):
+        start=self.start_page
+        end=self.end_page
+        while start <=end:
+            self.crawl_comment_by_page(start)
+            start=start+1
+            time.sleep(3)
 
-norm_corpus = normalize_corpus(toy_corpus)
+class Saver(threading.Thread):
+    def __init__(self,result_queue,productid,owner_memberid,method='db',db='sumaitong',user='root',password='xhhaysq'):
+        super().__init__()
+        self.result_queue = result_queue
+        self.productid=productid
+        self.owner_memberid=owner_memberid
+        self.method=method
+        self.db=db
+        self.user=user
+        self.password=password
+        self.conn=mysql.connector.connect(user=self.user, password=self.password,database=self.db)
+    def save_data_to_csv(self,data):
+        filename=self.owner_memberid+self.productid+".csv"
+        with open(filename,"a",newline = "",encoding='utf-8') as f:
+            writer = csv.writer(f,dialect = "excel")
+            writer.writerow([data['no'],self.productid,data['username'],data['usercountry'],data['buyer_feedback'],data['star'],data['picture_num'],data['feedback_time'],data['additional_feedback']])
+    def save_data_to_db(self,data):
+        try:
+            cursor=self.conn.cursor()
+            cursor.execute('insert into comment (no,productid,username,usercountry,buyer_feedback,star,picture_num,feedback_time,additional_feedback) values (%s,%s,%s,%s,%s,%s,%s,%s,%s)',[data['no'],self.productid,data['username'],data['usercountry'],data['buyer_feedback'],data['star'],data['picture_num'],data['feedback_time'],data['additional_feedback']])
+            self.conn.commit()
+        except Exception as e:
+            print("插入数据出错")
+            print(e)
+    def run(self):
+        i=0
+        while True:
+            data = self.result_queue.get()
+            data['no']=i
+            if self.method=='db':
+                self.save_data_to_db(data)
+            elif self.method=='csv':
+                self.save_data_to_csv(data)
+            else:
+                pass
+            print("插入第"+str(i)+'条数据')
+            i=i+1
+    def closeConn(self):
+        self.conn.close()
+def main(productid,owner_memberid,companyid,thread_num=10):
+    result_queue = queue.Queue()
+    url=get_url(productid,owner_memberid,companyid)
+    print("token Url:"+url)
 
-vectorizer, tfidf_matrix = build_feature_matrix(norm_corpus, 
-                                    feature_type='tfidf')
-td_matrix = tfidf_matrix.transpose()
-                              
-td_matrix = td_matrix.multiply(td_matrix > 0)
+    t1=time.time()
+    total_page=get_total_page(url)
+    t2=time.time()
+    print('获取总页数耗时:'+str(t2-t1))
+    spyders=[]
 
-total_topics = 2
-feature_names = vectorizer.get_feature_names()
-
-u, s, vt = low_rank_svd(td_matrix, singular_count=total_topics)
-weights = u.transpose() * s[:, None]
-
-def get_topics_terms_weights(weights, feature_names):
-    feature_names = np.array(feature_names)
-    sorted_indices = np.array([list(row[::-1]) 
-                           for row 
-                           in np.argsort(np.abs(weights))])
-    sorted_weights = np.array([list(wt[index]) 
-                               for wt, index 
-                               in zip(weights,sorted_indices)])
-    sorted_terms = np.array([list(feature_names[row]) 
-                             for row 
-                             in sorted_indices])
-    
-    topics = [np.vstack((terms.T, 
-                     term_weights.T)).T 
-              for terms, term_weights 
-              in zip(sorted_terms, sorted_weights)]     
-    
-    return topics            
-  
-                       
-def print_topics_udf(topics, total_topics=1,
-                     weight_threshold=0.0001,
-                     display_weights=False,
-                     num_terms=None):
-    
-    for index in range(total_topics):
-        topic = topics[index]
-        topic = [(term, float(wt))
-                 for term, wt in topic]
-        topic = [(word, round(wt,2)) 
-                 for word, wt in topic 
-                 if abs(wt) >= weight_threshold]
-                     
-        if display_weights:
-            print 'Topic #'+str(index+1)+' with weights'
-            print topic[:num_terms] if num_terms else topic
-        else:
-            print 'Topic #'+str(index+1)+' without weights'
-            tw = [term for term, wt in topic]
-            print tw[:num_terms] if num_terms else tw
-        print
-topics = get_topics_terms_weights(weights, feature_names)        
-print_topics_udf(topics=topics,
-                 total_topics=total_topics,
-                 weight_threshold=0.15,
-                 display_weights=False)
-
-def train_lsi_model_gensim(corpus, total_topics=2):
-    
-    norm_tokenized_corpus = normalize_corpus(corpus, tokenize=True)
-    dictionary = corpora.Dictionary(norm_tokenized_corpus)
-    mapped_corpus = [dictionary.doc2bow(text) 
-                     for text in norm_tokenized_corpus]
-    tfidf = models.TfidfModel(mapped_corpus)
-    corpus_tfidf = tfidf[mapped_corpus]
-    lsi = models.LsiModel(corpus_tfidf, 
-                          id2word=dictionary,
-                          num_topics=total_topics)
-    return lsi
- 
-
-
-
-
-def train_lda_model_gensim(corpus, total_topics=2):
-    
-    norm_tokenized_corpus = normalize_corpus(corpus, tokenize=True)
-    dictionary = corpora.Dictionary(norm_tokenized_corpus)
-    mapped_corpus = [dictionary.doc2bow(text) 
-                     for text in norm_tokenized_corpus]
-    tfidf = models.TfidfModel(mapped_corpus)
-    corpus_tfidf = tfidf[mapped_corpus]
-    lda = models.LdaModel(corpus_tfidf, 
-                          id2word=dictionary,
-                          iterations=1000,
-                          num_topics=total_topics)
-    return lda                     
-
-
-
-lda_gensim = train_lda_model_gensim(toy_corpus,
-                                    total_topics=2)
-                                    
-print_topics_gensim(topic_model=lda_gensim,
-                    total_topics=2,
-                    num_terms=5,
-                    display_weights=True)                                    
-
-                     
-from sklearn.decomposition import LatentDirichletAllocation
-
-norm_corpus = normalize_corpus(toy_corpus)
-vectorizer, tfidf_matrix = build_feature_matrix(norm_corpus, 
-                                    feature_type='tfidf')                     
-total_topics = 2
-lda = LatentDirichletAllocation(n_topics=total_topics, 
-                                max_iter=1000,
-                                learning_method='online', 
-                                learning_offset=50.,
-                                random_state=42)
-lda.fit(tfidf_matrix)
-
-feature_names = vectorizer.get_feature_names()
-weights = lda.components_
-
-topics = get_topics_terms_weights(weights, feature_names)
-print_topics_udf(topics=topics,
-                 total_topics=total_topics,
-                 num_terms=8,
-                 display_weights=True)
-                 
-                 
-from sklearn.decomposition import NMF
-
-norm_corpus = normalize_corpus(toy_corpus)
-vectorizer, tfidf_matrix = build_feature_matrix(norm_corpus, 
-                                    feature_type='tfidf')                     
-total_topics = 2
-nmf = NMF(n_components=total_topics, 
-          random_state=42, alpha=.1, l1_ratio=.5)
-nmf.fit(tfidf_matrix)      
-
-feature_names = vectorizer.get_feature_names()
-weights = nmf.components_
-
-topics = get_topics_terms_weights(weights, feature_names)
-print_topics_udf(topics=topics,
-                 total_topics=total_topics,
-                 num_terms=None,
-                 display_weights=True)   
-                 
-import pandas as pd
-import numpy as np 
-                 
-CORPUS = pd.read_csv('amazon_skyrim_reviews.csv')                     
-CORPUS = np.array(CORPUS['Reviews'])
-
-# view sample review
-print CORPUS[12]
-
-        
-total_topics = 5
-        
-lsi_gensim = train_lsi_model_gensim(CORPUS,
-                                    total_topics=total_topics)
-print_topics_gensim(topic_model=lsi_gensim,
-                    total_topics=total_topics,
-                    num_terms=10,
-                    display_weights=False) 
-
-
-lda_gensim = train_lda_model_gensim(CORPUS,
-                                    total_topics=total_topics)
-print_topics_gensim(topic_model=lda_gensim,
-                    total_topics=total_topics,
-                    num_terms=10,
-                    display_weights=False) 
-
-
-norm_corpus = normalize_corpus(CORPUS)
-vectorizer, tfidf_matrix = build_feature_matrix(norm_corpus, 
-                                    feature_type='tfidf') 
-feature_names = vectorizer.get_feature_names()
-
-
-lda = LatentDirichletAllocation(n_topics=total_topics, 
-                                max_iter=1000,
-                                learning_method='online', 
-                                learning_offset=10.,
-                                random_state=42)
-lda.fit(tfidf_matrix)
-weights = lda.components_
-topics = get_topics_terms_weights(weights, feature_names)
-print_topics_udf(topics=topics,
-                 total_topics=total_topics,
-                 num_terms=10,
-                 display_weights=False)
-
-
-nmf = NMF(n_components=total_topics, 
-          random_state=42, alpha=.1, l1_ratio=.5)
-nmf.fit(tfidf_matrix)      
-
-feature_names = vectorizer.get_feature_names()
-weights = nmf.components_
-
-topics = get_topics_terms_weights(weights, feature_names)
-print_topics_udf(topics=topics,
-                 total_topics=total_topics,
-                 num_terms=10,
-                 display_weights=False)        
+    if total_page>0:
+        page_num_per_thread=int(total_page/thread_num)
+        for i in range(thread_num):
+            start_page=i*page_num_per_thread+1
+            end_page=(i+1)*page_num_per_thread
+            if(i==(thread_num-1)):
+                end_page=total_page
+            spyder = CommentSpyder(url,productid,owner_memberid,companyid,result_queue,start_page,end_page)
+            spyders.append(spyder)
+        for spyder in spyders:
+            spyder.start()
+        saver = Saver(result_queue,productid,owner_memberid)
+        saver.daemon = True
+        saver.start()
+        for i in range(10):
+            spyders[i].join()
+        saver.closeConn()
+if __name__ == '__main__':
+    productid=""
+    owner_memberid=""
+    companyid=""
+    main(productid,owner_memberid,companyid)
